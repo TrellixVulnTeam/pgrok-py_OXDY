@@ -11,7 +11,7 @@ This provide additional functionality of self-hosting tunnelling server to aws/d
 ## Installation
 
 ```sh
-pip install git+https://github.com/sandyz1000/pyngrok.git
+pip install git+https://github.com/sandyz1000/pgrok-py.git
 ```
 
 ## Basic Usage
@@ -25,8 +25,8 @@ from pgrok import pgrok
 # <PgrokTunnel: "http://<public_sub>.pgrok.io" -> "http://localhost:80">
 http_tunnel = pgrok.connect()
 # Open a SSH tunnel
-# <PgrokTunnel: "tcp://0.tcp.pgrok.io:12345" -> "localhost:22">
-ssh_tunnel = pgrok.connect(22, "tcp")
+# <PgrokTunnel: "https://colabshell.ejemplo.me" -> "localhost:8080">
+ssh_tunnel = pgrok.connect(addr=8080, proto='http', name='colabshell')
 ```
 
 The `connect` method takes `kwargs` as well, which allows us to pass additional properties that are [supported by pgrok](https://github.com/jerson/pgrok/blob/master/docs/DEVELOPMENT.md).

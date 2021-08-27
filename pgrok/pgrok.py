@@ -1,36 +1,42 @@
 import logging
 import os
+import re
 import sys
 import uuid
 import yaml
 import time
 from pgrok import tools
+from copy import deepcopy
 import subprocess
 import atexit
-import shlex
-from pgrok.exception import PgrokError, PgrokInstallError, PgrokSecurityError
+import threading
+import tempfile
+from pgrok.exception import PgrokError, PgrokSecurityError
 
+__version__ = "5.0.6"
 logger = logging.getLogger(__name__)
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.DEBUG)
+logger.addHandler(handler)
 
 _current_tunnels = {}
 _config_cache = None
 _current_processes = {}
-__version__ = "5.0.6"
-
 _default_config = {
     "server_addr": "ejemplo.me:4443",
     "tunnels": {
-        "pypgrok-default": {
+        "pgrok_default": {
             "proto": {"http": 8080},
             "subdomain": "pypgrok"
         }
     }
 }
 
-
+_default_pypgrok_config = None
 BIN_DIR = os.path.normpath(os.path.join(os.path.abspath(os.path.dirname(__file__)), "bin"))
 DEFAULT_PGROK_PATH = os.path.join(BIN_DIR, tools.get_pgrok_bin())
-DEFAULT_PGROK_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".pgrok", "pgrok.yml")
+DEFAULT_PGROK_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".pgrok", "pgrok4.yml")
+SAVE_DEFAULT_CONFIG = False
 
 
 def _validate_path(pgrok_path):
@@ -86,8 +92,9 @@ class PgrokProcess:
     def __init__(self, proc, pgrok_config):
         self.proc = proc
         self.pgrok_config = pgrok_config
-
+        self.public_url = None
         self.api_url = None
+        self.client_id = None
         self.logs = []
         self.startup_error = None
 
@@ -100,6 +107,10 @@ class PgrokProcess:
 
     def __str__(self):  # pragma: no cover
         return "PgrokProcess: \"{}\"".format(self.api_url)
+
+    @staticmethod
+    def _line_has_error(log):
+        return log.lvl in ["ERROR", "CRITICAL"]
 
     def _log_startup_line(self, line):
         """
@@ -116,14 +127,18 @@ class PgrokProcess:
         if log is None:
             return
         elif self._line_has_error(log):
-            self.startup_error = log.err
+            self.startup_error = log.msg
         else:
+            if log.msg is None:
+                return
+            log_msg = log.msg.lower()
             # Log pgrok startup states as they come in
-            if "serving web interface" in log.msg and log.addr is not None:
+            if "serving web interface" in log_msg and log.addr is not None:
                 self.api_url = "http://{}".format(log.addr)
-            elif "tunnel established at" in log.msg:
+            elif "tunnel established at" in log_msg:
                 self._tunnel_started = True
-            elif "[client] authenticated with server, client id" in log.msg:
+                self.public_url = log.public_url
+            elif "authenticated with server, client id" in log_msg:
                 self._client_connected = True
 
         return log
@@ -144,6 +159,7 @@ class PgrokProcess:
             return None
 
         logger.log(getattr(logging, log.lvl), log.line)
+        # print(f"{log.lvl} --> {log.msg}")
         self.logs.append(log)
         if len(self.logs) > self.pgrok_config.max_logs:
             self.logs.pop(0)
@@ -153,40 +169,103 @@ class PgrokProcess:
 
         return log
 
+    def healthy(self):
+        """
+        Check whether the ``ngrok`` process has finished starting up and is in a running, healthy state.
+
+        :return: ``True`` if the ``ngrok`` process is started, running, and healthy.
+        :rtype: bool
+        """
+        if not self.api_url or \
+                not self._tunnel_started or \
+                not self._client_connected:
+            return False
+
+        if not self.api_url.lower().startswith("http"):
+            raise PgrokSecurityError("URL must start with \"http\": {}".format(self.api_url))
+
+        return self.proc.poll() is None and self.startup_error is None
+
+    def _monitor_process(self):
+        thread = threading.current_thread()
+
+        thread.alive = True
+        while thread.alive and self.proc.poll() is None:
+            self._log_line(self.proc.stdout.readline())
+
+        self._monitor_thread = None
+
+    def start_monitor_thread(self):
+        """
+        Start a thread that will monitor the ``ngrok`` process and its logs until it completes.
+
+        If a monitor thread is already running, nothing will be done.
+        """
+        if self._monitor_thread is None:
+            logger.debug("Monitor thread will be started")
+
+            self._monitor_thread = threading.Thread(target=self._monitor_process)
+            self._monitor_thread.daemon = True
+            self._monitor_thread.start()
+
+    def stop_monitor_thread(self):
+        """
+        Set the monitor thread to stop monitoring the ``ngrok`` process after the next log event. This will not
+        necessarily terminate the thread immediately, as the thread may currently be idle, rather it sets a flag
+        on the thread telling it to terminate the next time it wakes up.
+
+        This has no impact on the ``ngrok`` process itself, only ``pyngrok``'s monitor of the process and
+        its logs.
+        """
+        if self._monitor_thread is not None:
+            logger.debug("Monitor thread will be stopped")
+
+            self._monitor_thread.alive = False
+
 
 class PgrokLog:
     """An object containing a parsed log from the ``pgrok`` process."""
 
     def __init__(self, line):
         self.line = line.strip()
-        self.t = None
         self.lvl = "NOTSET"
         self.msg = None
-        self.err = None
         self.addr = None
+        self.tag = None
+        self.public_url = None
 
-        for i in shlex.split(self.line):
-            if "=" not in i:
-                continue
+        found = re.search(r'\bINFO|DEBG|EROR|WARN\b', line)
+        if found:
+            value = found.group().upper()
+            if value == "CRIT":
+                value = "CRITICAL"
+            elif value in ["ERR", "EROR"]:
+                value = "ERROR"
+            elif value == "WARN":
+                value = "WARNING"
+            elif value in ["DEBG", "DEBUG"]:
+                value = "DEBUG"
 
-            key, value = i.split("=", 1)
+            if not hasattr(logging, value):
+                value = self.lvl
+            setattr(self, 'lvl', value)
+        # Split each caption and set attributes
+        log_msg = [li.strip() for li in re.split(r'\[|\]', line) if li.strip()]
+        if len(log_msg) >= 2:
+            self.msg = log_msg[-1]
+            self.tag = log_msg[-2]
+            # Match ip address in the payload
+            re_ipaddress = re.compile(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{4})')
+            ip_addr = re_ipaddress.search(self.msg)
+            if ip_addr and self.tag == "web":
+                self.addr = ip_addr.group()
 
-            if key == "lvl":
-                if not value:
-                    value = self.lvl
-
-                value = value.upper()
-                if value == "CRIT":
-                    value = "CRITICAL"
-                elif value in ["ERR", "EROR"]:
-                    value = "ERROR"
-                elif value == "WARN":
-                    value = "WARNING"
-
-                if not hasattr(logging, value):
-                    value = self.lvl
-
-            setattr(self, key, value)
+            # Match public url
+            re_hostname = re.compile(
+                r"(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$")
+            public_url = re_hostname.search(self.msg)
+            if public_url:
+                self.public_url = public_url.group()
 
     def __repr__(self):
         return "<PgrokLog: t={} lvl={} msg=\"{}\">".format(self.t, self.lvl, self.msg)
@@ -250,7 +329,6 @@ class PgrokConfig:
                  pgrok_path=None,
                  config_path=None,
                  auth_token=None,
-                 region=None,
                  monitor_thread=True,
                  log_event_callback=None,
                  startup_timeout=15,
@@ -262,13 +340,13 @@ class PgrokConfig:
         self.pgrok_path = DEFAULT_PGROK_PATH if pgrok_path is None else pgrok_path
         self.config_path = DEFAULT_PGROK_CONFIG_PATH if config_path is None else config_path
         self.auth_token = auth_token
-        self.region = region
         self.monitor_thread = monitor_thread
         self.log_event_callback = log_event_callback
         self.startup_timeout = startup_timeout
         self.max_logs = max_logs
         self.request_timeout = request_timeout
         self.start_new_session = start_new_session
+        self.reconnect_session_retries = reconnect_session_retries
 
 
 class PgrokTunnel:
@@ -293,14 +371,14 @@ class PgrokTunnel:
     :vartype api_url: str
     """
 
-    def __init__(self, data, pypgrok_config, api_url):
+    def __init__(self, data, pypgrok_config):
         self.name = data.get("name")
         self.proto = data.get("proto")
-        self.uri = data.get("uri")
-        self.public_url = data.get("public_url")
         self.addr = data.get("addr")
+        self.public_url = data.get("public_url")
+        self.uri = data.get("uri", 'localhost')
+        self.api_url = data.get('api_url')
         self.pypgrok_config = pypgrok_config
-        self.api_url = api_url
 
     def __repr__(self):
         return "<PgrokTunnel: \"{}\" -> \"{}\">".format(self.public_url, self.addr) \
@@ -309,6 +387,11 @@ class PgrokTunnel:
     def __str__(self):  # pragma: no cover
         return "PgrokTunnel: \"{}\" -> \"{}\"".format(self.public_url, self.config["addr"]) \
             if getattr(self, "addr", None) else "<pending Tunnel>"
+
+    def __getitem__(self, key):
+        if hasattr(self, key):
+            return getattr(self, key)
+        raise KeyError(f"Key with {key} doesn't exist")
 
 
 def get_pgrok_config(config_path, use_cache=True):
@@ -348,8 +431,7 @@ def install_default_config(config_path, data=None):
         data = {}
 
     config_dir = os.path.dirname(config_path)
-    if not os.path.exists(config_dir):
-        os.makedirs(config_dir)
+    os.makedirs(config_dir, exist_ok=True)
     if not os.path.exists(config_path):
         open(config_path, "w").close()
 
@@ -369,12 +451,15 @@ def validate_config(data):
     :param data: A dictionary of things to be validated as config items.
     :type data: dict
     """
+    # TODO: Write a proper validation for verifying the config data
+    # - Check if tunnels key exists
     if data.get("web_addr", None) is False:
         raise PgrokError("\"web_addr\" cannot be False, as the pgrok API is a dependency for pypgrok")
     elif data.get("log_format") == "json":
         raise PgrokError("\"log_format\" must be \"term\" to be compatible with pypgrok")
     elif data.get("log_level", "info") not in ["info", "debug"]:
         raise PgrokError("\"log_level\" must be \"info\" to be compatible with pypgrok")
+    return True
 
 
 def get_default_config():
@@ -423,58 +508,51 @@ def _is_process_running(pgrok_path):
     return False
 
 
-def _start_process(pyngrok_config, retries=0):
+def _start_process(pgrok_config, retries=0, service_name='pgrok_default'):
     """
     Start a ``pgrok`` process with no tunnels. This will start the ``pgrok`` web interface, against
     which HTTP requests can be made to create, interact with, and destroy tunnels.
 
-    :param pyngrok_config: The ``pgrok`` configuration to use when interacting with the ``pgrok`` binary.
-    :type pyngrok_config: PgrokConfig
+    :param pgrok_config: The ``pgrok`` configuration to use when interacting with the ``pgrok`` binary.
+    :type pgrok_config: PgrokConfig
     :param retries: The retry attempt index, if ``pgrok`` fails to establish the tunnel.
     :type retries: int, optional
     :return: The ``pgrok`` process.
     :rtype: PgrokProcess
     """
-    # TODO: Fix this logic
-    if pyngrok_config.config_path is None:
-        config_path = pyngrok_config.config_path
-    else:
-        config_path = DEFAULT_PGROK_CONFIG_PATH
+    # TODO: Extend this to support many pgrok process and save each one in _current_process map
+    _validate_path(pgrok_config.pgrok_path)
+    _validate_config(pgrok_config.config_path)
 
-    _validate_path(pyngrok_config.pgrok_path)
-    _validate_config(config_path)
-
-    start = [pyngrok_config.pgrok_path, "-log=stdout"]
-    logger.info("Starting ngrok with config file: {}".format(config_path))
-    start.append("-config={}".format(config_path))
-    if pyngrok_config.auth_token:
+    start = [pgrok_config.pgrok_path, "-log=stdout"]
+    logger.info("Starting pgrok with config file: {}".format(pgrok_config.config_path))
+    start.append("-config={}".format(pgrok_config.config_path))
+    if pgrok_config.auth_token:
         logger.info("Overriding default auth token")
-        start.append("-authtoken={}".format(pyngrok_config.auth_token))
-    start += ["start", "pypgrok_default"]
+        start.append("-authtoken={}".format(pgrok_config.auth_token))
+    start += ["start", service_name]
     popen_kwargs = {"stdout": subprocess.PIPE, "universal_newlines": True}
     if os.name == "posix":
-        popen_kwargs.update(start_new_session=pyngrok_config.start_new_session)
-    elif pyngrok_config.start_new_session:
+        popen_kwargs.update(start_new_session=pgrok_config.start_new_session)
+    elif pgrok_config.start_new_session:
         logger.warning("Ignoring start_new_session=True, which requires POSIX")
     proc = subprocess.Popen(start, **popen_kwargs)
     atexit.register(_terminate_process, proc)
 
     logger.debug("pgrok process starting with PID: {}".format(proc.pid))
 
-    pgrok_process = PgrokProcess(proc, pyngrok_config)
-    _current_processes[pyngrok_config.pgrok_path] = pgrok_process
+    pgrok_process = PgrokProcess(proc, pgrok_config)
+    _current_processes[pgrok_config.pgrok_path] = pgrok_process
 
-    timeout = time.time() + pyngrok_config.startup_timeout
+    timeout = time.time() + pgrok_config.startup_timeout
     while time.time() < timeout:
         line = proc.stdout.readline()
         pgrok_process._log_startup_line(line)
 
         if pgrok_process.healthy():
             logger.debug("pgrok process has started with API URL: {}".format(pgrok_process.api_url))
-
-            if pyngrok_config.monitor_thread:
+            if pgrok_config.monitor_thread:
                 pgrok_process.start_monitor_thread()
-
             break
         elif pgrok_process.startup_error is not None or \
                 pgrok_process.proc.poll() is not None:
@@ -482,15 +560,14 @@ def _start_process(pyngrok_config, retries=0):
 
     if not pgrok_process.healthy():
         # If the process did not come up in a healthy state, clean up the state
-        kill_process(pyngrok_config.pgrok_path)
+        kill_process(pgrok_config.pgrok_path)
 
         if pgrok_process.startup_error is not None:
-            if pgrok_process.logs[-1].msg == "failed to reconnect session" and \
-                    retries < pyngrok_config.reconnect_session_retries:
+            if retries < pgrok_config.reconnect_session_retries:
                 logger.warning("pgrok reset our connection, retrying in 0.5 seconds ...")
                 time.sleep(0.5)
 
-                return _start_process(pyngrok_config, retries + 1)
+                return _start_process(pgrok_config, retries + 1, service_name=service_name)
             else:
                 raise PgrokError("The pgrok process errored on start: {}.".format(pgrok_process.startup_error),
                                  pgrok_process.logs,
@@ -601,12 +678,12 @@ def install_pgrok(pypgrok_config=None):
         install_default_config(config_path, data=_default_config)
 
     # Install the default config, even if we don't need it this time, if it doesn't already exist
-    if DEFAULT_PGROK_CONFIG_PATH != config_path and \
+    if SAVE_DEFAULT_CONFIG and DEFAULT_PGROK_CONFIG_PATH != config_path and \
             not os.path.exists(DEFAULT_PGROK_CONFIG_PATH):
         install_default_config(DEFAULT_PGROK_CONFIG_PATH, data=_default_config)
 
 
-def get_pgrok_process(pgrok_config=None):
+def get_pgrok_process(pgrok_config=None, service_name='pgrok_default'):
     """
     Get the current ``pgrok`` process for the given config's ``pgrok_path``.
 
@@ -632,16 +709,16 @@ def get_pgrok_process(pgrok_config=None):
     if _is_process_running(pgrok_config.pgrok_path):
         return _current_processes[pgrok_config.pgrok_path]
 
-    return _start_process(pgrok_config)
+    return _start_process(pgrok_config, service_name=service_name)
 
 
-def connect(addr=None, proto=None, name=None, pypgrok_config=None, **options):
+def connect(addr=None, proto=None, name=None, pgrok_config=None, **options):
     """
     Establish a new ``pgrok`` tunnel for the given protocol to the given port, returning an object representing
     the connected tunnel.
 
     If a `tunnel definition in pgrok's config file  matches the given ``name``, it will be loaded and used to 
-    start the tunnel. When ``name`` is ``None`` and a "pypgrok-default" tunnel definition exists in ``pgrok``'s 
+    start the tunnel. When ``name`` is ``None`` and a "pgrok_default" tunnel definition exists in ``pgrok``'s 
     config, it will be loaded and use. Any ``kwargs`` passed as ``options`` will
     override properties from the loaded tunnel definition.
 
@@ -658,23 +735,15 @@ def connect(addr=None, proto=None, name=None, pypgrok_config=None, **options):
         only a single tunnel is needed, pass ``bind_tls=True`` and a reference to the ``https`` tunnel will be returned.
 
     """
-    if pypgrok_config is None:
-        pypgrok_config = get_default_config()
+    if pgrok_config is None:
+        pgrok_config = get_default_config()
 
-    if pypgrok_config.config_path is not None:
-        config_path = pypgrok_config.config_path
-    else:
-        config_path = DEFAULT_PGROK_CONFIG_PATH
-
-    if os.path.exists(config_path):
-        config = get_pgrok_config(config_path)
-    else:
-        config = {}
+    config = get_pgrok_config(pgrok_config.config_path) if os.path.exists(pgrok_config.config_path) else {}
 
     # If a "pgrok-default" tunnel definition exists in the pgrok config, use that
     tunnel_definitions = config.get("tunnels", {})
-    if not name and "pgrok-default" in tunnel_definitions:
-        name = "pgrok-default"
+    if not name and "pgrok_default" in tunnel_definitions:
+        name = "pgrok_default"
 
     # Use a tunnel definition for the given name, if it exists
     if name and name in tunnel_definitions:
@@ -701,14 +770,29 @@ def connect(addr=None, proto=None, name=None, pypgrok_config=None, **options):
             name = "{}-file-{}".format(proto, uuid.uuid4())
 
     logger.info("Opening tunnel named: {}".format(name))
-    config = {
+
+    if not os.path.exists(pgrok_config.config_path) or \
+            not validate_config(get_pgrok_config(pgrok_config.config_path, use_cache=False)):
+        # Create a temporary config with namedtempfile
+        with tempfile.NamedTemporaryFile(suffix='.yml') as tmp:
+            _default_config['tunnels'].pop('pgrok_default', None)
+            tunnel_name = {}
+            tunnel_name['proto'] = {proto: addr}
+            tunnel_name['proto'].update(options)
+            _default_config['tunnels'][name] = tunnel_name
+            pgrok_config.config_path = tmp.name
+
+    process = get_pgrok_process(pgrok_config, service_name=name)
+    # Set tunnel parameter
+    _tunnelcfg = {
         "name": name,
         "addr": addr,
         "proto": proto
     }
-    options.update(config)
-    process = get_pgrok_process(pypgrok_config)
-    tunnel = PgrokTunnel(config, pypgrok_config, process.api_url)
+    options.update(_tunnelcfg)
+    options['api_url'] = process.api_url
+    options['public_url'] = process.public_url
+    tunnel = PgrokTunnel(options, pgrok_config)
     logger.debug("Creating tunnel with options: {}".format(options))
     _current_tunnels[tunnel.public_url] = tunnel
     return tunnel
@@ -724,13 +808,15 @@ def disconnect(public_url, pgrok_config=None):
         overriding :func:`~pypgrok.conf.get_default()`.
     :type pgrok_config: PypgrokConfig, optional
     """
+    # TODO: Extend this to support many pgrok process and save each one in _current_process map
     if pgrok_config is None:
         pgrok_config = get_default_config()
 
     # If pgrok is not running, there are no tunnels to disconnect
     if not _is_process_running(pgrok_config.pgrok_path):
         return
-    # TODO: Check if process with public url is running then destroy it
+
+    kill_process(pgrok_config.pgrok_path)
     tunnel = _current_tunnels[public_url]
     logger.info("Disconnecting tunnel: {}".format(tunnel.public_url))
     _current_tunnels.pop(public_url, None)
@@ -790,19 +876,6 @@ def get_version(pypgrok_config=None):
     ngrok_version = get_process(pypgrok_config.pgrok_path, ["version"])
 
     return ngrok_version, __version__
-
-
-def update(pypgrok_config=None):
-    """
-    Update ``pgrok`` for the given config's ``pgrok_path``, if an update is available.
-
-    :param pypgrok_config: A ``pypgrok`` configuration to use when interacting with the ``pgrok`` binary,
-        overriding :func:`~pypgrok.get_default_config()`.
-    :type pgrok_config: PypgrokConfig, optional
-    :return: The result from the ``pgrok`` update.
-    :rtype: str
-    """
-    # TODO: Check if new version of pgrok is available for download
 
 
 def main():

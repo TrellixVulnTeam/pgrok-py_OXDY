@@ -10,7 +10,6 @@ import logging
 from http import HTTPStatus
 from urllib.request import urlopen
 
-from pgrok.exception import PgrokInstallError
 from pgrok.exception import PgrokInstallError, PgrokSecurityError
 logger = logging.getLogger(__name__)
 
@@ -118,8 +117,8 @@ def _download_file(url, retries=0, **kwargs):
         raise PgrokSecurityError("URL must start with \"http\": {}".format(url))
 
     try:
-        print_progress("Downloading ngrok ...", progress_enabled=_print_progress_enabled)
-        logger.debug("Download ngrok from {} ...".format(url))
+        print_progress("Downloading pgrok ...", progress_enabled=_print_progress_enabled)
+        logger.debug("Download pgrok from {} ...".format(url))
         
         local_filename = url.split("/")[-1]
         response = urlopen(url, **kwargs)

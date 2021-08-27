@@ -233,28 +233,9 @@ class TestPgrok(PgrokTestCase):
         pgrok_tunnel = pgrok.connect()
         time.sleep(1)
 
-        # WHEN
-        # TODO: Get current process from global _process variable
-
         # THEN
-        self.assertEqual(pgrok_tunnel.name, response["name"])
+        self.assertEqual(pgrok_tunnel.name, pgrok_tunnel["name"])
         self.assertTrue(pgrok_tunnel.public_url.startswith("http"))
-
-    def test_process_request_delete_data_updated(self):
-        # GIVEN
-        current_process = pgrok.get_ngrok_process(pyngrok_config=self.pyngrok_config)
-        pgrok.connect()
-        time.sleep(1)
-        tunnels = pgrok.get_tunnels()
-        self.assertEqual(len(tunnels), 2)
-
-        # WHEN
-        # TODO: Get current process from global _process variable
-
-        # THEN
-        self.assertIsNone(response)
-        tunnels = pgrok.get_tunnels()
-        self.assertEqual(len(tunnels), 1)
 
     def test_process_request_fails(self):
         # GIVEN
@@ -296,7 +277,8 @@ class TestPgrok(PgrokTestCase):
         # GIVEN
         self.assertEqual(len(pgrok._current_processes.keys()), 0)
         subdomain = self.create_unique_subdomain()
-        pyngrok_config = self.copy_with_updates(self.pyngrok_config, auth_token=os.environ["NGROK_AUTHTOKEN"],
+        pyngrok_config = self.copy_with_updates(self.pyngrok_config,
+                                                auth_token=os.environ["NGROK_AUTHTOKEN"],
                                                 region="au")
 
         # WHEN
@@ -391,11 +373,10 @@ class TestPgrok(PgrokTestCase):
         pyngrok_config = self.copy_with_updates(self.pyngrok_config, auth_token=os.environ["NGROK_AUTHTOKEN"])
         pgrok_tunnel = pgrok.connect("file:///", pyngrok_config=pyngrok_config)
         time.sleep(1)
-        api_url = pgrok.get_pgrok_process(pyngrok_config).api_url
+        public_url = pgrok.get_pgrok_process(pyngrok_config).public_url
 
         # WHEN
-        # response = ngrok.api_request("{}{}".format(api_url, pgrok_tunnel.uri), "GET")
-        # TODO: Get current process from global _process variable
+        response = pgrok._current_tunnels[public_url]
 
         # THEN
         self.assertEqual(pgrok_tunnel.name, response["name"])
