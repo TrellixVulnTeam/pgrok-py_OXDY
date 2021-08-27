@@ -770,10 +770,9 @@ def connect(addr=None, proto=None, name=None, pgrok_config=None, **options):
             name = "{}-file-{}".format(proto, uuid.uuid4())
 
     logger.info("Opening tunnel named: {}".format(name))
-
-    if not os.path.exists(pgrok_config.config_path) or \
-            not validate_config(get_pgrok_config(pgrok_config.config_path, use_cache=False)):
-        # Create a temporary config with namedtempfile
+    
+    # Create a temporary config yml and if config_path not set earlier
+    if not os.path.exists(pgrok_config.config_path) or not validate_config(config):
         with tempfile.NamedTemporaryFile(suffix='.yml') as tmp:
             _default_config['tunnels'].pop('pgrok_default', None)
             tunnel_name = {}
