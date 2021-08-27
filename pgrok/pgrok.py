@@ -6,7 +6,6 @@ import uuid
 import yaml
 import time
 from pgrok import tools
-from copy import deepcopy
 import subprocess
 import atexit
 import threading

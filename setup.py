@@ -5,7 +5,7 @@ setup(
     name="pgrok",
     packages=["pgrok"],
     include_package_data=True,
-    install_requires=["psutils", "PyYAML"],
+    install_requires=["PyYAML"],
     python_requires=">=3.5",
     entry_points={"console_scripts": ["pgrokpy=pgrok.pgrok:main"]},
     version="0.1.0",
