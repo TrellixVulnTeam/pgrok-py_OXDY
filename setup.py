@@ -14,6 +14,14 @@ setup(
     long_description_content_type="text/markdown",
     author="Sandip Dey",
     author_email="sandip.dey1988@yahoo.com",
+    keywords=['ssh-tunnell', 'unix-tools', ''],
     url="https://github.com/sandyz1000/pgrok-py",
-    license="Apache License"
+    license="Apache License",
+    classifiers=[
+        'Development Status :: 3 - Alpha',
+        'Intended Audience :: Developers',
+        'Topic :: Software Development :: Build Tools',
+        'License :: OSI Approved :: Apache License',
+        'Programming Language :: Python :: 3.7+',
+    ],
 )

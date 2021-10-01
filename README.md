@@ -11,7 +11,7 @@ This provide additional functionality of self-hosting tunnelling server to aws/d
 ## Installation
 
 ```sh
-pip install git+https://github.com/sandyz1000/pgrok-py.git
+pip install pgrok
 ```
 
 ## Basic Usage
