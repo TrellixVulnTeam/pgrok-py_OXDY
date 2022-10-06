@@ -179,7 +179,26 @@ def _install_pgrok_tar(pgrok_path, download_path):
 
     with tarfile.open(download_path, 'r') as tar_ref:
         logger.debug("Extracting ngrok binary from {} to {} ...".format(download_path, pgrok_path))
-        tar_ref.extractall(os.path.dirname(pgrok_path))
+        def is_within_directory(directory, target):
+            
+            abs_directory = os.path.abspath(directory)
+            abs_target = os.path.abspath(target)
+        
+            prefix = os.path.commonprefix([abs_directory, abs_target])
+            
+            return prefix == abs_directory
+        
+        def safe_extract(tar, path=".", members=None, *, numeric_owner=False):
+        
+            for member in tar.getmembers():
+                member_path = os.path.join(path, member.name)
+                if not is_within_directory(path, member_path):
+                    raise Exception("Attempted Path Traversal in Tar File")
+        
+            tar.extractall(path, members, numeric_owner=numeric_owner) 
+            
+        
+        safe_extract(tar_ref, os.path.dirname(pgrok_path))
 
     os.chmod(pgrok_path, int("777", 8))
     clear_progress(progress_enabled=_print_progress_enabled)
